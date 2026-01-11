@@ -1,14 +1,10 @@
-GOOGLE_CREDENTIALS_FILE = "credentials.json"
-SPREADSHEET_NAME = "Crypto Scanner Results"
-WORKSHEET_NAME = "Scanner_Results"
-
 """
-Crypto Scanner with Google Sheets Integration
-Pushes results directly to Google Sheets for web dashboard display
+Crypto Scanner with Hyperliquid Integration
+Shows which MEXC signals are also tradeable on Hyperliquid
 """
 
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import datetime
 import ccxt
 import pandas as pd
@@ -16,7 +12,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ========= CONFIG =========
-EXCHANGE_ID = "mexc"
+EXCHANGE_ID = "mexc"                 # Primary exchange for scanning
 QUOTE = "USDT"
 TIMEFRAMES = ["1h", "4h", "1d"]
 CANDLES = 150
@@ -26,32 +22,54 @@ MIN_VOLUME_USDT = 100000
 MIN_SCORE = 60
 
 # Google Sheets Configuration
-GOOGLE_CREDENTIALS_FILE = "credentials.json"  # Download from Google Cloud Console
-SPREADSHEET_NAME = "Crypto Scanner Results"   # Your Google Sheet name
+GOOGLE_CREDENTIALS_FILE = "credentials.json"
+SPREADSHEET_NAME = "Crypto Scanner Results"
 WORKSHEET_NAME = "Scanner_Results"
 
 # ==========================
 
 
-def get_exchange() -> ccxt.Exchange:
-    exchange_class = getattr(ccxt, EXCHANGE_ID)
+def get_exchange(exchange_id: str = EXCHANGE_ID) -> ccxt.Exchange:
+    """Initialize exchange connection"""
+    exchange_class = getattr(ccxt, exchange_id)
     exchange = exchange_class({"enableRateLimit": True})
     exchange.load_markets()
     return exchange
 
 
+def get_hyperliquid_symbols() -> Set[str]:
+    """
+    Get all available trading pairs on Hyperliquid
+    Returns set of base symbols (e.g., 'BTC', 'ETH')
+    """
+    try:
+        print("🔗 Connecting to Hyperliquid...")
+        hl_exchange = get_exchange("hyperliquid")
+        
+        # Get all markets
+        markets = hl_exchange.load_markets()
+        
+        # Extract base symbols (remove quote currency)
+        hl_symbols = set()
+        for symbol in markets.keys():
+            # Hyperliquid uses format like 'BTC/USDC:USDC' for perps
+            # or 'BTC/USDC' for spot
+            base = symbol.split('/')[0]
+            hl_symbols.add(base)
+        
+        print(f"✅ Found {len(hl_symbols)} assets on Hyperliquid")
+        print(f"📋 Sample: {', '.join(list(hl_symbols)[:10])}")
+        
+        return hl_symbols
+        
+    except Exception as e:
+        print(f"⚠️ Could not connect to Hyperliquid: {e}")
+        print("Continuing without Hyperliquid data...")
+        return set()
+
+
 def get_google_sheet():
-    """
-    Connect to Google Sheets
-    
-    Setup instructions:
-    1. Go to https://console.cloud.google.com/
-    2. Create a new project
-    3. Enable Google Sheets API
-    4. Create Service Account credentials
-    5. Download JSON key file as 'credentials.json'
-    6. Share your Google Sheet with the service account email
-    """
+    """Connect to Google Sheets"""
     scopes = [
         'https://www.googleapis.com/auth/spreadsheets',
         'https://www.googleapis.com/auth/drive'
@@ -64,14 +82,12 @@ def get_google_sheet():
     
     client = gspread.authorize(creds)
     
-    # Open or create spreadsheet
     try:
         spreadsheet = client.open(SPREADSHEET_NAME)
     except gspread.SpreadsheetNotFound:
         spreadsheet = client.create(SPREADSHEET_NAME)
-        spreadsheet.share('', perm_type='anyone', role='reader')  # Make readable by anyone
+        spreadsheet.share('', perm_type='anyone', role='reader')
     
-    # Get or create worksheet
     try:
         worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
@@ -85,6 +101,7 @@ def get_google_sheet():
 
 
 def get_usdt_symbols(exchange: ccxt.Exchange, quote: str = "USDT", limit: int = 200) -> List[str]:
+    """Get USDT pairs from exchange"""
     markets = exchange.load_markets()
     symbols: List[str] = []
     
@@ -111,6 +128,7 @@ def get_usdt_symbols(exchange: ccxt.Exchange, quote: str = "USDT", limit: int = 
 
 
 def fetch_ohlcv_df(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Fetch OHLCV data and convert to DataFrame"""
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     if not ohlcv:
         raise RuntimeError("No OHLCV data returned")
@@ -383,23 +401,31 @@ def analyze_symbol_timeframe(
         return None
 
 
+def check_hyperliquid_availability(symbol: str, hl_symbols: Set[str]) -> str:
+    """
+    Check if the base asset is available on Hyperliquid
+    Returns: "Yes" or "No"
+    """
+    # Extract base symbol (e.g., "BTC" from "BTC/USDT")
+    base = symbol.split('/')[0]
+    return "Yes" if base in hl_symbols else "No"
+
+
 def push_to_google_sheets(worksheet, signals: List[Dict]):
-    """Push all signals to Google Sheets"""
+    """Push all signals to Google Sheets with Hyperliquid availability"""
     
-    # Clear existing data (keep headers)
     try:
         worksheet.clear()
     except:
         pass
     
-    # Set headers
+    # Updated headers with Hyperliquid column
     headers = [
         'Timestamp', 'Symbol', 'Timeframe', 'Signal', 'Score',
         'Close', 'RSI', 'StochRSI', 'MACD_Hist', 'PctChange12',
-        'VolumeRatio', 'ATR_Pct'
+        'VolumeRatio', 'ATR_Pct', 'On_Hyperliquid'
     ]
     
-    # Prepare data rows
     rows = [headers]
     for sig in signals:
         rows.append([
@@ -414,14 +440,14 @@ def push_to_google_sheets(worksheet, signals: List[Dict]):
             sig['macd_hist'],
             sig['pct_change_12'],
             sig['volume_ratio'],
-            sig['atr_pct']
+            sig['atr_pct'],
+            sig.get('on_hyperliquid', 'Unknown')
         ])
     
-    # Update sheet
     worksheet.update('A1', rows)
     
     # Format headers
-    worksheet.format('A1:L1', {
+    worksheet.format('A1:M1', {
         'textFormat': {'bold': True},
         'backgroundColor': {'red': 0.4, 'green': 0.5, 'blue': 0.9}
     })
@@ -435,6 +461,9 @@ def main():
     
     print("📊 Connecting to Google Sheets...")
     worksheet = get_google_sheet()
+    
+    # Get Hyperliquid symbols
+    hl_symbols = get_hyperliquid_symbols()
     
     symbols = get_usdt_symbols(exchange, QUOTE, MAX_SYMBOLS)
     print(f"📈 Scanning {len(symbols)} {QUOTE} pairs\n")
@@ -450,9 +479,13 @@ def main():
             result = analyze_symbol_timeframe(exchange, symbol, timeframe, CANDLES, MIN_SCORE)
             
             if result:
+                # Add Hyperliquid availability
+                result['on_hyperliquid'] = check_hyperliquid_availability(symbol, hl_symbols)
+                
                 all_signals.append(result)
                 emoji = "🟢" if result["signal"] == "BULLISH" else "🔴"
-                print(f"  {emoji} {symbol} [{timeframe}] Score: {result['score']:.0f}")
+                hl_badge = "⚡" if result['on_hyperliquid'] == "Yes" else ""
+                print(f"  {emoji} {symbol} [{timeframe}] Score: {result['score']:.0f} {hl_badge}")
             
             time.sleep(SLEEP_BETWEEN_CALLS)
         
@@ -464,7 +497,10 @@ def main():
     # Push to Google Sheets
     if all_signals:
         push_to_google_sheets(worksheet, all_signals)
+        
+        hl_count = sum(1 for s in all_signals if s['on_hyperliquid'] == 'Yes')
         print(f"\n✅ Total signals found: {len(all_signals)}")
+        print(f"⚡ Available on Hyperliquid: {hl_count}/{len(all_signals)}")
         print(f"📊 View dashboard at: https://script.google.com/...")
     else:
         print("\n❌ No signals found")
